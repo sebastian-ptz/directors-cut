@@ -1,10 +1,13 @@
 import sys
 import cv2
 from PySide6.QtCore import Qt, QUrl, QSize
-from PySide6.QtGui import QPixmap, QPainter, QPen, QAction, QColor
+from PySide6.QtGui import QPixmap, QPainter, QPen, QAction, QColor, QIcon
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
-from PySide6.QtWidgets import *
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QToolBar, QStyle,
+    QSlider, QLabel, QPushButton, QComboBox, QSizePolicy, QSplitter, QFileDialog
+)
 
 class VideoPlayer(QMainWindow):
     def __init__(self):
@@ -14,20 +17,62 @@ class VideoPlayer(QMainWindow):
         self.actual_fps = 0.0
         self.volume_before_mute = 75
 
-        self.setWindowTitle("360° Directors Cut Viewer")
+        self.setWindowTitle("360° Directors Cut")
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
         self.resize(800, 700)
 
-        # Menu
-        menu_bar = self.menuBar()
-        file_menu = menu_bar.addMenu("&File")
-        open_action = QAction("&Open Video...", self)
-        open_action.triggered.connect(self.open_file)
-        file_menu.addAction(open_action)
+        # --- VIEWS ---
+        self.directors_map_label = QLabel("Saliency Map will Be Displayed Here")
+        self.directors_map_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.directors_map_label.setAlignment(Qt.AlignCenter)
+        self.directors_map_label.setStyleSheet("border: 1px solid black; background-color: #f0f0f0;")
 
-        # Mediaplayer
+        self.saliency_map_view_label = QLabel("Saliency Map View Area")
+        self.saliency_map_view_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.saliency_map_view_label.setAlignment(Qt.AlignCenter)
+        self.saliency_map_view_label.setStyleSheet("border: 1px solid black; background-color: #f0f0f0;")
+        self.saliency_map_view_label.hide()
+
+        # --- BUTTONS (Toolbar) ---
+        self.toolbar = QToolBar("View Options")
+        self.toolbar.setMovable(True)
+        actual_icon_size = 20
+        icon_size_metric = self.style().pixelMetric(QStyle.PM_ToolBarIconSize)
+        if icon_size_metric > 0:
+            scaled_size = int(icon_size_metric * 0.8)
+            if scaled_size > 0:
+                actual_icon_size = scaled_size
+        toolbar_icon_qsize = QSize(actual_icon_size, actual_icon_size)
+        self.toolbar.setIconSize(toolbar_icon_qsize)
+        self.addToolBar(Qt.LeftToolBarArea, self.toolbar)
+
+        self.open_file_action = QAction(QIcon("icons/file-open.svg"), "Open Video File", self)
+        self.toolbar.addAction(self.open_file_action)
+        self.toolbar.addSeparator()
+
+        self.directors_map_action = QAction(QIcon("icons/directors-map.svg"), "Directors Map", self)
+        self.directors_map_action.setCheckable(True)
+        self.saliency_map_action = QAction(QIcon("icons/saliency-map.svg"), "Saliency Map", self)
+        self.saliency_map_action.setCheckable(True)
+        self.toolbar.addAction(self.directors_map_action)
+        self.toolbar.addAction(self.saliency_map_action)
+        self.toolbar.addSeparator()
+
+        self.directors_cut_action = QAction(QIcon("icons/directors-cut.svg"), "Directors Cut", self)
+        self.directors_cut_action.setCheckable(True)
+        self.saliency_overlay_action = QAction(QIcon("icons/saliency-overlay.svg"), "Saliency Overlay", self)
+        self.saliency_overlay_action.setCheckable(True)
+        self.toolbar.addAction(self.directors_cut_action)
+        self.toolbar.addAction(self.saliency_overlay_action)
+        self.toolbar.addSeparator()
+
+        self.highlight_brush_action = QAction(QIcon("icons/paint-brush.svg"), "Highlight Brush", self)
+        self.highlight_brush_action.setCheckable(True)
+        self.toolbar.addAction(self.highlight_brush_action)
+
+        # --- TOP AREA (Video Player, Controls, Timeline) ---
         self.media_player = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.media_player.setAudioOutput(self.audio_output)
@@ -35,54 +80,46 @@ class VideoPlayer(QMainWindow):
         self.video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.media_player.setVideoOutput(self.video_widget)
 
-        # Timeline
         self.timeline_slider = QSlider(Qt.Horizontal)
-        self.timeline_slider.sliderMoved.connect(self.set_position)
+        self.timeline_slider.sliderPressed.connect(self.on_slider_draged)
+        self.timeline_slider.sliderReleased.connect(self.on_slider_dopped)
+        self.timeline_slider.sliderMoved.connect(self.on_slider_moved)
         self.timeline_slider.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.timecode_label = QLabel("00:00")
         self.timecode_label.setMinimumWidth(45)
         self.timecode_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         timeline_area = QHBoxLayout()
-
         timeline_area.addWidget(self.timeline_slider, 1)
         timeline_area.addWidget(self.timecode_label)
         timeline_widget = QWidget()
         timeline_widget.setLayout(timeline_area)
         timeline_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
-        # Controls
         self.play_button = QPushButton()
         self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         self.play_button.clicked.connect(self.play_video)
-
         self.saliency_predictors = QComboBox()
         self.saliency_predictors.addItems(["one", "two"])
         self.saliency_predictors.currentTextChanged.connect(self.update_saliency_display)
-
         self.framecode_label = QLabel("frame: - / -")
         self.framecode_label.setMinimumWidth(100)
         self.framecode_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-
         self.video_filename = QLabel("No video loaded")
         self.video_filename.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.video_filename.setAlignment(Qt.AlignCenter)
-
         self.volume_button = QPushButton()
         self.volume_button.setIconSize(QSize(16,16))
         self.volume_button.setFixedSize(QSize(24,24))
         self.volume_button.setStyleSheet("QPushButton { border: none; background-color: transparent; }")
         self.volume_button.clicked.connect(self.toggle_mute)
-
         self.volume_slider = QSlider(Qt.Horizontal)
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setMaximumWidth(150)
         self.volume_slider.valueChanged.connect(self.set_volume)
-
         self.speed_combo = QComboBox()
         self.speed_combo.addItems(["0.5x", "1.0x", "1.5x", "2.0x"])
         self.speed_combo.setCurrentText("1.0x")
         self.speed_combo.currentTextChanged.connect(self.set_playback_rate)
-
         controls_layout = QHBoxLayout()
         controls_layout.addWidget(self.play_button)
         controls_layout.addWidget(self.saliency_predictors)
@@ -95,7 +132,6 @@ class VideoPlayer(QMainWindow):
         controls_widget.setLayout(controls_layout)
         controls_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
-        # Top area
         top_area = QVBoxLayout()
         top_area.addWidget(self.video_widget, 2)
         top_area.addWidget(controls_widget)
@@ -104,20 +140,15 @@ class VideoPlayer(QMainWindow):
         top_area_widget.setLayout(top_area)
         top_area_widget.setMinimumHeight(350)
 
-        # Saliency map label
-        self.saliency_label = QLabel("Saliency Map will Be Displayed Here")
-        self.saliency_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.saliency_label.setAlignment(Qt.AlignCenter)
-        self.saliency_label.setStyleSheet("border: 1px solid black; background-color: #f0f0f0;")
-
-        # Splitter
         self.main_splitter = QSplitter(Qt.Vertical)
         self.main_splitter.addWidget(top_area_widget)
-        self.main_splitter.addWidget(self.saliency_label)
+        self.main_splitter.addWidget(self.directors_map_label)
+        self.main_splitter.addWidget(self.saliency_map_view_label)
+        self.saliency_map_view_label.setVisible(False)
         self.main_splitter.setSizes([500, 120])
         main_layout.addWidget(self.main_splitter, 1)
 
-        # Signals
+        # --- SIGNALS ---
         self.media_player.positionChanged.connect(self.update_slider_position)
         self.media_player.durationChanged.connect(self.update_slider_range)
         self.media_player.playbackStateChanged.connect(self.update_play_button_icon)
@@ -126,14 +157,24 @@ class VideoPlayer(QMainWindow):
         self.audio_output.mutedChanged.connect(self.update_volume_icon)
         self.audio_output.volumeChanged.connect(self.handle_volume_changed_externally)
 
-        # Initial state
+        # --- INITIAL STATE ---
         self.audio_output.setVolume(self.volume_before_mute / 100.0)
         self.update_saliency_display()
         self.timecode_label.setText("00:00")
         self.framecode_label.setText("frame: - / -")
         self.update_volume_icon()
+        self.switch_view("directors-map")
+        self.load_video("videos/mono_jaunt.mp4")
 
-    # --- File Loading ---
+        # --- BUTTON FUNCTIONALITY ---
+        self.open_file_action.triggered.connect(self.open_file)
+        self.directors_map_action.triggered.connect(lambda: self.switch_view("directors-map"))
+        self.saliency_map_action.triggered.connect(lambda: self.switch_view("saliency-map"))
+        self.directors_cut_action.triggered.connect(self.toggle_directors_cut_overlay)
+        self.saliency_overlay_action.triggered.connect(self.toggle_saliency_overlay)
+        self.highlight_brush_action.triggered.connect(self.toggle_highlight_brush)
+
+    # --- FILE OPEN FUNCTIONALITY ---
     def open_file(self):
         file_dialog = QFileDialog(self)
         file_dialog.setNameFilter("Video Files (*.mp4 *.avi *.mkv *.mov *.wmv)")
@@ -163,7 +204,31 @@ class VideoPlayer(QMainWindow):
         self.framecode_label.setText("frame: 0 / 0")
         self.update_saliency_display()
 
-    # --- Playback Controls ---
+    # --- VIEWS FUNCTIONALITY ---
+    def switch_view(self, view_name: str):
+        if view_name == "directors-map":
+            self.directors_map_label.show()
+            self.saliency_map_view_label.hide()
+            self.directors_map_action.setChecked(True)
+            self.saliency_map_action.setChecked(False)
+        elif view_name == "saliency-map":
+            self.directors_map_label.hide()
+            self.saliency_map_view_label.show()
+            self.directors_map_action.setChecked(False)
+            self.saliency_map_action.setChecked(True)
+
+    # --- OVERLAYS FUNCTIONALITY ---
+    def toggle_saliency_overlay(self, checked: bool):
+        print(f"Saliency overlay toggled: {checked}")
+
+    def toggle_directors_cut_overlay(self, checked: bool):
+        print(f"Directors cut overlay toggled: {checked}")
+
+    # --- TOOLS FUNCTIONALITY ---
+    def toggle_highlight_brush(self, checked: bool):
+        print(f"Highlight brush toggled: {checked}")
+
+    # --- VIDEO CONTROLS ---
     def play_video(self):
         if self.media_player.playbackState() == QMediaPlayer.PlayingState:
             self.media_player.pause()
@@ -177,15 +242,28 @@ class VideoPlayer(QMainWindow):
         except ValueError:
             print(f"Invalid playback rate format: {rate_text}")
 
-    # --- Timeline/Slider ---
+    # --- TIMELINE / SLIDER ---
     def set_position(self, position: int):
         self.media_player.setPosition(position)
 
-    def update_slider_position(self, position: int):
-        self.timeline_slider.setValue(position)
-        self.timecode_label.setText(self.format_time(position))
+    def on_slider_draged(self):
+        self.is_slider_dragging = True
+
+    def on_slider_dopped(self):
+        self.is_slider_dragging = False
+        self.set_position(self.timeline_slider.value())
+
+    def on_slider_moved(self, value):
+        self.timecode_label.setText(self.format_time(value))
         duration = self.media_player.duration()
-        self.framecode_label.setText(self.format_framecode(position, duration))
+        self.framecode_label.setText(self.format_framecode(value, duration))
+
+    def update_slider_position(self, position: int):
+        if not getattr(self, 'is_slider_dragging', False):
+            self.timeline_slider.setValue(position)
+            self.timecode_label.setText(self.format_time(position))
+            duration = self.media_player.duration()
+            self.framecode_label.setText(self.format_framecode(position, duration))
 
     def update_slider_range(self, duration: int):
         self.timeline_slider.setRange(0, duration)
@@ -211,7 +289,7 @@ class VideoPlayer(QMainWindow):
             total_frames_str = "-"
         return f"frame: {current_frame_str} / {total_frames_str}"
 
-    # --- Volume Controls ---
+    # --- VOLUME CONTROLS ---
     def set_volume(self, value: int):
         if self.audio_output:
             new_volume_float = value / 100.0
@@ -248,14 +326,13 @@ class VideoPlayer(QMainWindow):
             self.volume_slider.setValue(slider_value)
         self.update_volume_icon()
 
-    # --- UI State Updates ---
     def update_play_button_icon(self, state: QMediaPlayer.PlaybackState):
         if state == QMediaPlayer.PlayingState:
             self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
         else:
             self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
 
-    # --- Saliency Display ---
+    # --- SALIENCY DISPLAY ---
     def update_saliency_display(self, algorithm_name: str = None):
         if algorithm_name is None:
             algorithm_name = self.saliency_predictors.currentText()
@@ -266,10 +343,9 @@ class VideoPlayer(QMainWindow):
 
     def draw_saliency_progress_marker(self):
         if self.current_saliency_map is None or self.current_saliency_map.isNull():
-            self.saliency_label.setText("Select a saliency map type.")
             if self.media_player.source().isEmpty():
-                self.saliency_label.setText("Open a video and select a saliency map type.")
-            self.saliency_label.setPixmap(QPixmap())
+                self.directors_map_label.setText("No video loaded.")
+            self.directors_map_label.setPixmap(QPixmap())
             return
 
         pixmap = self.current_saliency_map.copy()
@@ -285,7 +361,7 @@ class VideoPlayer(QMainWindow):
                 painter.drawLine(marker_x, 0, marker_x, pixmap.height())
                 painter.end()
 
-        self.saliency_label.setPixmap(pixmap)
+        self.directors_map_label.setPixmap(pixmap)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
