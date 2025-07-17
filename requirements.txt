@@ -1,2 +1,5 @@
 opencv-python
+numpy
+matplotlib
+scipy
 PySide6
