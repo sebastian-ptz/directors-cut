@@ -209,27 +209,27 @@ class VideoPlayer(QMainWindow):
         self.toolbar.setIconSize(toolbar_icon_qsize)
         player_layout.addWidget(self.toolbar)
 
-        self.open_file_action = QAction(QIcon("📁"), "Open Video File", self)
+        self.open_file_action = QAction(QIcon(".\icons\file-open.svg"), "Open Video File", self)
         self.toolbar.addAction(self.open_file_action)
         self.toolbar.addSeparator()
 
-        self.directors_map_action = QAction(QIcon("🎬"), "Directors Map", self)
+        self.directors_map_action = QAction(QIcon(".\icons\directors-map.svg"), "Directors Map", self)
         self.directors_map_action.setCheckable(True)
-        self.saliency_map_action = QAction(QIcon("🗺️"), "Saliency Map", self)
+        self.saliency_map_action = QAction(QIcon(".\icons\saliency-map.svg"), "Saliency Map", self)
         self.saliency_map_action.setCheckable(True)
         self.toolbar.addAction(self.directors_map_action)
         self.toolbar.addAction(self.saliency_map_action)
         self.toolbar.addSeparator()
 
-        self.directors_cut_action = QAction(QIcon("✂️"), "Directors Cut", self)
+        self.directors_cut_action = QAction(QIcon(".\icons\directors-cut.svg"), "Directors Cut", self)
         self.directors_cut_action.setCheckable(True)
-        self.saliency_overlay_action = QAction(QIcon("🔍"), "Saliency Overlay", self)
+        self.saliency_overlay_action = QAction(QIcon(".\icons\saliency-overlay.svg"), "Saliency Overlay", self)
         self.saliency_overlay_action.setCheckable(True)
         self.toolbar.addAction(self.directors_cut_action)
         self.toolbar.addAction(self.saliency_overlay_action)
         self.toolbar.addSeparator()
 
-        self.highlight_brush_action = QAction(QIcon("🖌️"), "Highlight Brush", self)
+        self.highlight_brush_action = QAction(QIcon(".\icons\paint-brush.svg"), "Highlight Brush", self)
         self.highlight_brush_action.setCheckable(True)
         self.toolbar.addAction(self.highlight_brush_action)
 
@@ -933,6 +933,7 @@ class VideoPlayer(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
     player = VideoPlayer()
     player.show()
     sys.exit(app.exec())
