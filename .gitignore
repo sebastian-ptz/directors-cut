@@ -43,3 +43,4 @@ Thumbs.db
 
 # Extracted frames
 VideoData/
+saliency_maps/
