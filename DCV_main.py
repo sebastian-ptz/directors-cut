@@ -15,6 +15,8 @@ import logging
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 from FastVRViewportExtractor import VRViewportExtractor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import islice
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -188,6 +190,96 @@ class ViewportExtractor:
         norm = np.linalg.norm(v)
         return v / norm if norm > 0 else v
 
+class FrameExtractor:
+    """Extracts frames from video files for analysis"""
+    
+    def __init__(self, output_base_dir: str = "VideoData"):
+        self.output_base_dir = Path(output_base_dir)
+        self.output_base_dir.mkdir(exist_ok=True)
+        
+    def extract_frames(self, video_path: str) -> Tuple[str, bool]:
+        """
+        Extract frames from a video file.
+        
+        Args:
+            video_path: Path to the video file
+            
+        Returns:
+            Tuple[str, bool]: (output_directory_path, success)
+        """
+        if not Path(video_path).exists():
+            logger.error(f"Input video file not found: {video_path}")
+            return "", False
+
+        try:
+            # Get video information
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                logger.error("Could not open video file for frame extraction")
+                return "", False
+                
+            fps = int(cap.get(cv2.CAP_PROP_FPS))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            # Create output directory for this video
+            video_name = Path(video_path).stem
+            output_video_dir = self.output_base_dir / f"{video_name}_{fps}"
+            output_video_dir.mkdir(exist_ok=True)
+            
+            logger.info(f"Extracting frames to: {output_video_dir}")
+            logger.info(f"Video FPS: {fps}, Total frames: {total_frames}")
+            
+            # Extract frames
+            frame_count = 1
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                    
+                frame_filename = output_video_dir / f"frame_{frame_count:05d}.jpg"
+                cv2.imwrite(str(frame_filename), frame)
+                
+                frame_count += 1
+                if frame_count % 100 == 0:
+                    logger.info(f"Extracted {frame_count}/{total_frames} frames...")
+            
+            cap.release()
+            logger.info(f"Successfully extracted {frame_count} frames")
+            
+            return str(output_video_dir), True
+            
+        except Exception as e:
+            logger.error(f"Error during frame extraction: {e}")
+            return "", False
+    
+    def check_existing_frames(self, video_path: str) -> Tuple[str, bool]:
+        """
+        Check if frames for this video already exist.
+        
+        Args:
+            video_path: Path to the video file
+            
+        Returns:
+            Tuple[str, bool]: (frames_directory_path, exists)
+        """
+        try:
+            video_name = Path(video_path).stem
+            
+            # Check for existing frame directories
+            for dir_path in self.output_base_dir.glob(f"{video_name}_*"):
+                if dir_path.is_dir():
+                    # Verify frames exist
+                    frame_files = list(dir_path.glob("frame_*.jpg"))
+                    if frame_files:
+                        logger.info(f"Found existing frames in: {dir_path}")
+                        return str(dir_path), True
+            
+            return "", False
+            
+        except Exception as e:
+            logger.error(f"Error checking existing frames: {e}")
+            return "", False
+
 class OverlapCalculator:
     """Calculates overlap between viewport and saliency maps"""
     
@@ -273,6 +365,7 @@ class DirectorsCutProcessor:
         self.viewport_extractor = ViewportExtractor()
         self.overlap_calculator = OverlapCalculator(self.viewport_extractor)
         self.attention_analyzer = AttentionAnalyzer()
+        self.frame_extractor = FrameExtractor(output_base_dir="VideoData")
         
         self.video_metadata: Optional[VideoMetadata] = None
         self.directors_cut_data: List[DirectorsCutFrame] = []
@@ -385,6 +478,7 @@ class DirectorsCutProcessor:
 
     def generate_missing_saliency_maps(
         self, 
+        video_path: str,
         video_frames_dir: str, 
         saliency_output_dir: str,
         existing_maps: Dict[int, str]
@@ -404,6 +498,23 @@ class DirectorsCutProcessor:
         
         if not frames_dir.exists():
             logger.warning(f"Video frames directory not found: {frames_dir}")
+            frames_path, success = self.frame_extractor.extract_frames(video_path)
+            if not success:
+                logger.error("Failed to extract video frames")
+                return all_maps
+            frames_dir = Path(frames_path)
+            return all_maps
+        
+        # Check if frames directory is empty
+        if not any(frames_dir.iterdir()):
+            logger.info("Frames directory is empty, extracting frames...")
+            frames_path, success = self.frame_extractor.extract_frames(video_path)
+            if not success:
+                logger.error("Failed to extract video frames")
+                return all_maps
+            frames_dir = Path(frames_path)
+        elif not any(frames_dir.glob("frame_*.jpg")):
+            logger.error("No frame files found in frames directory")
             return all_maps
         
         # Process only the missing frames
@@ -438,6 +549,7 @@ class DirectorsCutProcessor:
         
         return all_maps
     
+    
     def process_video_analysis(
         self,
         video_path: str,
@@ -457,24 +569,21 @@ class DirectorsCutProcessor:
         # Step 2: Check for existing saliency maps
         existing_maps = self.check_saliency_maps(saliency_dir)
         
+        
         # Step 3: Generate missing saliency maps
         all_saliency_maps = self.generate_missing_saliency_maps(
-            video_frames_dir, saliency_dir, existing_maps
+             video_path, video_frames_dir, saliency_dir, existing_maps
         )
         
         # Step 4: Calculate overlaps and attention scores
         attention_scores = []
         
-        for dc_frame in self.directors_cut_data:
-            frame_idx = dc_frame.frame_index
-            
-            if frame_idx not in all_saliency_maps:
-                logger.warning(f"No saliency map for frame {frame_idx}")
-                continue
-            
+        #TODO: consider parallel processing for performance
+        def process_frame(frame_data):
+            dc_frame, saliency_map_path = frame_data
             try:
                 # Load saliency map
-                saliency_map = Image.open(all_saliency_maps[frame_idx])
+                saliency_map = Image.open(saliency_map_path)
                 
                 # Calculate overlap
                 overlap_percentage = self.overlap_calculator.calculate_saliency_overlap(
@@ -485,21 +594,43 @@ class DirectorsCutProcessor:
                 attention_score = self.attention_analyzer.calculate_attention_score(
                     overlap_percentage
                 )
-                attention_score.frame_index = frame_idx
-                attention_scores.append(attention_score)
+                attention_score.frame_index = dc_frame.frame_index
                 
-                logger.info(
-                    f"Frame {frame_idx}: {overlap_percentage:.2%} overlap, "
-                    f"{attention_score.attention_level} attention"
-                )
+                return attention_score
                 
             except Exception as e:
-                logger.error(f"Error processing frame {frame_idx}: {e}")
-                continue
+                logger.error(f"Error processing frame {dc_frame.frame_index}: {e}")
+            return None
+
+        # Prepare frame data for processing
+        frame_data = [
+            (dc_frame, all_saliency_maps.get(dc_frame.frame_index))
+            for dc_frame in self.directors_cut_data
+            if dc_frame.frame_index in all_saliency_maps
+        ]
+        
+        # Process frames in parallel using ThreadPoolExecutor
+        attention_scores = []
+        batch_size = 100  # Adjust based on available memory
+        
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            for i in range(0, len(frame_data), batch_size):
+                batch = frame_data[i:i + batch_size]
+                futures = [executor.submit(process_frame, data) for data in batch]
+                
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result is not None:
+                        attention_scores.append(result)
+                        logger.info(
+                            f"Frame {result.frame_index}: {result.overlap_percentage:.2%} overlap, "
+                            f"{result.attention_level} attention"
+                        )
         
         # Step 5: Generate attention map
+        video_title = video_path.split('/')[-1].rsplit('.', 1)[0]
         if attention_scores:
-            output_map_path = self.output_dir / "attention_map.png"
+            output_map_path = self.output_dir / f"{video_title}_attention_map.png"
             self.attention_analyzer.generate_attention_map(
                 attention_scores, str(output_map_path)
             )
@@ -559,7 +690,7 @@ class DirectorsCutProcessor:
             "high_attention_percentage": (attention_counts["high"] / len(attention_scores)) * 100
         }
 
-# Main application class that integrates with your GUI
+# Main application class that integrates with GUI
 class DirectorsCutApplication:
     """Main application class"""
     
@@ -597,9 +728,8 @@ if __name__ == "__main__":
     app = DirectorsCutApplication()
     
     #TODO define standart paths 
-    # Define your paths
-    video_path = "videos/mono_jaunt.mp4"
-    dc_file_path = "DC-war.txt"
+    video_path = "videos/mono_smart.mp4"
+    dc_file_path = "DirectorsCut/DC-smart.txt"
     video_frames_dir = "VideoData/mono_smart_59"
     saliency_maps_dir = "saliency_maps"
     output_dir = "results"
