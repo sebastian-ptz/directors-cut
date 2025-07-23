@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 import threading
 
 from PySide6.QtCore import Qt, QUrl, QSize, QThread, Signal
-from PySide6.QtGui import QPixmap, QPainter, QPen, QAction, QColor, QIcon
+from PySide6.QtGui import QPixmap, QPainter, QPen, QAction, QColor, QIcon, QMouseEvent, QCursor 
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -121,12 +121,47 @@ class AnalysisWorker(QThread):
             logger.error(f"Analysis error: {e}")
             self.error_occurred.emit(str(e))
 
+class ClickableImageLabel(QLabel):
+    # Custom signal that emits a float (0.0 to 1.0) for the relative X position
+    positionClicked = Signal(float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Set cursor to pointing hand to indicate clickability
+        self.setCursor(QCursor(Qt.PointingHandCursor))
+
+        # Ensure content scales
+        self.setScaledContents(True)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumSize(QSize(1, 1)) # Allow collapsing
+
+    def mousePressEvent(self, event: QMouseEvent):
+        # Only process left mouse clicks
+        if event.button() == Qt.MouseButton.LeftButton:
+            # Get the click position relative to the QLabel itself
+            click_x = event.position().x()
+
+            # Get the current width of the QLabel
+            label_width = self.width()
+
+            if label_width > 0:
+                # Calculate the relative position (0.0 to 1.0)
+                relative_x = click_x / label_width
+                # Ensure it stays within bounds
+                relative_x = max(0.0, min(1.0, relative_x))
+                self.positionClicked.emit(relative_x)
+            else:
+                # Handle case where label might have 0 width (e.g., collapsed)
+                print("Label has zero width, cannot calculate relative position.")
+        super().mousePressEvent(event) # Call base class method to ensure normal event propagation
+
 class VideoPlayer(QMainWindow):
     def __init__(self):
         super().__init__()
         self.current_saliency_map = None
         self.total_frames = 0
         self.actual_fps = 0.0
+        self.video_duration_ms = 0
         self.volume_before_mute = 75
         self.attention_scores: List[AttentionScore] = []
         self.directors_cut_data: List[DirectorsCutFrame] = []
@@ -172,6 +207,12 @@ class VideoPlayer(QMainWindow):
         self.directors_cut_action.triggered.connect(self.toggle_directors_cut_overlay)
         self.saliency_overlay_action.triggered.connect(self.toggle_saliency_overlay)
         self.highlight_brush_action.triggered.connect(self.toggle_highlight_brush)
+        self.directors_map_label.positionClicked.connect(self.change_duration_using_directors_map)
+
+        # --- DIRECTORS MAP FUNCTIONALITY ---
+        self.media_player.durationChanged.connect(self.handle_duration_changed)
+        self.media_player.errorOccurred.connect(self.handle_media_error)
+        self.media_player.playbackStateChanged.connect(self.handle_playback_state)
 
         # Try to load default video
         if os.path.exists("videos/mono_jaunt.mp4"):
@@ -253,7 +294,7 @@ class VideoPlayer(QMainWindow):
         self.toolbar.addAction(self.highlight_brush_action)
 
         # --- VIEWS ---
-        self.directors_map_label = QLabel("Attention Map will be displayed here after analysis")
+        self.directors_map_label = ClickableImageLabel("Attention Map will be displayed here after analysis")
         self.directors_map_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.directors_map_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.directors_map_label.setStyleSheet("border: 1px solid black; background-color: #fff0f0;")
@@ -348,6 +389,7 @@ class VideoPlayer(QMainWindow):
         self.main_splitter.addWidget(top_area_widget)
         self.main_splitter.addWidget(self.directors_map_label)
         self.main_splitter.addWidget(self.saliency_map_view_label)
+        self.main_splitter.setChildrenCollapsible(False) # Ensures Directors Map and Saliency Map are not invisible
         self.saliency_map_view_label.setVisible(False)
         self.main_splitter.setSizes([500, 120]) # Initial sizes for splitter
         player_layout.addWidget(self.main_splitter, 1)
@@ -661,6 +703,27 @@ class VideoPlayer(QMainWindow):
             self.media_player.setPlaybackRate(rate)
         except Exception as e:
             logger.error(f"Playback rate error: {e}")
+
+    def handle_duration_changed(self, duration_ms: int):
+        self.video_duration_ms = duration_ms
+        print(f"Video duration loaded: {self.video_duration_ms} ms")
+        # Start playback after duration is known if you want
+        if self.media_player.playbackState() == QMediaPlayer.PlaybackState.StoppedState:
+             self.media_player.play()
+
+    def handle_media_error(self, error: QMediaPlayer.Error, error_string: str):
+        print(f"Media Player Error: {error} - {error_string}")
+
+    def handle_playback_state(self, state: QMediaPlayer.PlaybackState):
+        print(f"Playback state changed: {state}")
+
+    def change_duration_using_directors_map(self, relative_position: float):
+        if self.video_duration_ms > 0:
+            target_position_ms = int(relative_position * self.video_duration_ms)
+            self.media_player.setPosition(target_position_ms)
+            print(f"Clicked at {relative_position:.2f}, seeking to {target_position_ms} ms")
+        else:
+            print("Video duration not yet available or is 0. Cannot seek.")
 
     def switch_view(self, view_mode: str):
         """Switch between different display views."""
