@@ -18,6 +18,15 @@ from FastVRViewportExtractor import VRViewportExtractor
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import islice
 
+# FastSal imports
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import model.fastSal as fastsal
+from dataset.utils import read_vgg_img
+from utils import load_weight
+from generate_img import post_process_png
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -72,6 +81,22 @@ class AttentionScore:
         else:
             return "low"
 
+class FastSalDataset(Dataset):
+    """Dataset class for FastSal prediction on individual images"""
+    
+    def __init__(self, image_paths: List[str], output_paths: List[str]):
+        self.image_paths = image_paths
+        self.output_paths = output_paths
+        
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        output_path = self.output_paths[idx]
+        vgg_img, original_size = read_vgg_img(img_path, (192, 256))
+        return vgg_img, original_size, output_path
+        
+    def __len__(self):
+        return len(self.image_paths)
+
 class SaliencyGenerator(ABC):
     """Abstract base class for saliency map generators"""
     
@@ -88,53 +113,141 @@ class SaliencyGenerator(ABC):
 class FastSalGenerator(SaliencyGenerator):
     """FastSal saliency map generator implementation"""
     
-    def __init__(self):
+    def __init__(self, model_type: str = 'A', finetune_dataset: str = 'salicon', gpu: bool = True):
+        self.model_type = model_type
+        self.finetune_dataset = finetune_dataset
+        self.gpu = gpu and torch.cuda.is_available()
         self.model = None
+        self.batch_size = 4  # Adjust based on GPU memory
         self._check_fastsal_availability()
     
     def _check_fastsal_availability(self):
         """Check if FastSal is available and load model"""
         try:
-            # Import FastSal here to avoid dependency issues
-            # This is a placeholder - replace with actual FastSal import
-            # from fastsal import FastSal
-            # self.model = FastSal()
-            logger.info("FastSal model loaded successfully")
-        except ImportError:
-            logger.warning("FastSal not available, saliency generation will be limited")
+            # Load FastSal model
+            self.model = fastsal.fastsal(pretrain_mode=False, model_type=self.model_type)
+            
+            # Load weights
+            weights_path = f'weights/{self.finetune_dataset}_{self.model_type}.pth'
+            if not os.path.exists(weights_path):
+                logger.error(f"FastSal weights not found: {weights_path}")
+                self.model = None
+                return
+                
+            state_dict, opt_state = load_weight(weights_path, remove_decoder=False)
+            self.model.load_state_dict(state_dict)
+            
+            if self.gpu:
+                self.model.cuda()
+                
+            self.model.eval()  # Set to evaluation mode
+            logger.info(f"FastSal model loaded successfully (Type: {self.model_type}, Dataset: {self.finetune_dataset}, GPU: {self.gpu})")
+            
+        except Exception as e:
+            logger.error(f"FastSal not available: {e}")
             self.model = None
     
     def is_available(self) -> bool:
         return self.model is not None
     
     def generate_saliency_map(self, frame_path: str, output_path: str) -> bool:
-        """Generate saliency map using FastSal"""
+        """Generate saliency map using FastSal for a single frame"""
         if not self.is_available():
             logger.error("FastSal not available")
             return False
         
         try:
-            # Placeholder for actual FastSal implementation
-            # Replace this with actual FastSal API calls
-            frame = Image.open(frame_path)
+            # Create dataset for single image
+            dataset = FastSalDataset([frame_path], [output_path])
+            dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
             
-            # Mock saliency generation - replace with actual FastSal
-            saliency_map = self._mock_saliency_generation(frame)
-            saliency_map.save(output_path)
-            
-            logger.info(f"Saliency map generated: {output_path}")
-            return True
-            
+            with torch.no_grad():
+                for x, original_size_list, output_path_list in dataloader:
+                    if self.gpu:
+                        x = x.float().cuda()
+                    
+                    # Generate prediction
+                    y = self.model(x)
+                    y = nn.Sigmoid()(y)  # Apply sigmoid for final output
+                    
+                    if self.gpu:
+                        y = y.detach().cpu()
+                    
+                    y = y.numpy()
+                    
+                    # Process the prediction
+                    prediction = y[0, 0, :, :]  # First batch, first channel
+                    original_size = original_size_list[0].numpy()
+                    img_output_path = output_path_list[0]
+                    
+                    # Post-process and save
+                    img_data = post_process_png(prediction, original_size)
+                    cv2.imwrite(img_output_path, img_data)
+                    
+                    logger.info(f"Saliency map generated: {img_output_path}")
+                    return True
+                    
         except Exception as e:
             logger.error(f"Error generating saliency map: {e}")
             return False
+        
+        return False
     
-    def _mock_saliency_generation(self, frame: Image.Image) -> Image.Image:
-        """Mock saliency generation for testing purposes"""
-        # Create a simple gradient as mock saliency map
-        width, height = frame.size
-        saliency = np.random.rand(height, width) * 255
-        return Image.fromarray(saliency.astype(np.uint8))
+    def generate_batch_saliency_maps(self, frame_paths: List[str], output_paths: List[str]) -> List[bool]:
+        """Generate saliency maps for multiple frames in batches"""
+        if not self.is_available():
+            logger.error("FastSal not available")
+            return [False] * len(frame_paths)
+        
+        if len(frame_paths) != len(output_paths):
+            logger.error("Mismatch between frame paths and output paths")
+            return [False] * len(frame_paths)
+        
+        results = []
+        
+        try:
+            # Create dataset
+            dataset = FastSalDataset(frame_paths, output_paths)
+            dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, num_workers=2)
+            
+            with torch.no_grad():
+                for x, original_size_list, output_path_list in dataloader:
+                    if self.gpu:
+                        x = x.float().cuda()
+                    
+                    # Generate predictions
+                    y = self.model(x)
+                    y = nn.Sigmoid()(y)  # Apply sigmoid for final output
+                    
+                    if self.gpu:
+                        y = y.detach().cpu()
+                    
+                    y = y.numpy()
+                    
+                    # Process each prediction in the batch
+                    for i in range(y.shape[0]):
+                        try:
+                            prediction = y[i, 0, :, :]
+                            original_size = original_size_list[i].numpy()
+                            img_output_path = output_path_list[i]
+                            
+                            # Post-process and save
+                            img_data = post_process_png(prediction, original_size)
+                            cv2.imwrite(img_output_path, img_data)
+                            
+                            results.append(True)
+                            logger.info(f"Saliency map generated: {img_output_path}")
+                            
+                        except Exception as e:
+                            logger.error(f"Error processing batch item {i}: {e}")
+                            results.append(False)
+                            
+        except Exception as e:
+            logger.error(f"Error in batch saliency generation: {e}")
+            # Fill remaining results with False
+            results.extend([False] * (len(frame_paths) - len(results)))
+        
+        return results
 
 class ViewportExtractor:
     """Handles viewport extraction using FastVRViewportExtractor"""
@@ -223,7 +336,7 @@ class FrameExtractor:
             
             # Create output directory for this video
             video_name = Path(video_path).stem
-            output_video_dir = self.output_base_dir / f"{video_name}_{fps}"
+            output_video_dir = self.output_base_dir / f"{video_name}"
             output_video_dir.mkdir(exist_ok=True)
             
             logger.info(f"Extracting frames to: {output_video_dir}")
@@ -429,9 +542,11 @@ class DirectorsCutProcessor:
             # Matches png, jpg, jpeg files
             for file_path in saliency_path.glob("*.[pj][np][gj]*"):  # This line was Generated by Claude Sonnet 3.5
                 try:
-                    # Assuming naming convention: frame_XXXXX.ext
-                    frame_num = int(file_path.stem.split('_')[-1])
-                    existing_maps[frame_num] = str(file_path)
+                    # Assuming naming convention: out_frame_XXXXX.ext
+                    filename = file_path.stem
+                    if filename.startswith('out_frame_'):
+                        frame_num = int(filename.split('_')[-1])
+                        existing_maps[frame_num] = str(file_path)
                 except ValueError:
                     continue
         
@@ -483,7 +598,7 @@ class DirectorsCutProcessor:
         saliency_output_dir: str,
         existing_maps: Dict[int, str]
     ) -> Dict[int, str]:
-        """Generate missing saliency maps using FastSal"""
+        """Generate missing saliency maps using FastSal with batch processing"""
         saliency_output_path = Path(saliency_output_dir)
         saliency_output_path.mkdir(exist_ok=True)
         
@@ -503,7 +618,6 @@ class DirectorsCutProcessor:
                 logger.error("Failed to extract video frames")
                 return all_maps
             frames_dir = Path(frames_path)
-            return all_maps
         
         # Check if frames directory is empty
         if not any(frames_dir.iterdir()):
@@ -517,7 +631,11 @@ class DirectorsCutProcessor:
             logger.error("No frame files found in frames directory")
             return all_maps
         
-        # Process only the missing frames
+        # Prepare batch processing data
+        frame_paths = []
+        output_paths = []
+        frame_indices = []
+        
         for frame_idx in missing_frames:
             # Check if the frame file exists
             frame_file = None
@@ -531,24 +649,47 @@ class DirectorsCutProcessor:
                 logger.warning(f"Source frame {frame_idx} not found")
                 continue
             
-            # Generate saliency map
             output_file = saliency_output_path / f"out_frame_{frame_idx:05d}.png"
-            if self.saliency_generator.generate_saliency_map(
-                str(frame_file), 
-                str(output_file)
-            ):
-                all_maps[frame_idx] = str(output_file)
-                logger.info(f"Generated saliency map for frame {frame_idx}")
-            else:
-                logger.error(f"Failed to generate saliency map for frame {frame_idx}")
+            frame_paths.append(str(frame_file))
+            output_paths.append(str(output_file))
+            frame_indices.append(frame_idx)
+        
+        if not frame_paths:
+            logger.warning("No valid frames found for saliency generation")
+            return all_maps
+        
+        logger.info(f"Generating saliency maps for {len(frame_paths)} frames using FastSal batch processing...")
+        
+        # Process in batches using FastSal batch generation
+        batch_size = 8  # Adjust based on GPU memory
+        for i in range(0, len(frame_paths), batch_size):
+            batch_frame_paths = frame_paths[i:i+batch_size]
+            batch_output_paths = output_paths[i:i+batch_size]
+            batch_frame_indices = frame_indices[i:i+batch_size]
+            
+            logger.info(f"Processing batch {i//batch_size + 1}/{(len(frame_paths) + batch_size - 1)//batch_size}")
+            
+            # Generate saliency maps for this batch
+            results = self.saliency_generator.generate_batch_saliency_maps(
+                batch_frame_paths, batch_output_paths
+            )
+            
+            # Update the maps dictionary for successful generations
+            for j, (success, frame_idx, output_path) in enumerate(zip(results, batch_frame_indices, batch_output_paths)):
+                if success:
+                    all_maps[frame_idx] = output_path
+                    logger.info(f"Generated saliency map for frame {frame_idx}")
+                else:
+                    logger.error(f"Failed to generate saliency map for frame {frame_idx}")
         
         # Final verification
         is_complete, still_missing = self.check_saliency_maps_complete(saliency_output_path)
         if not is_complete:
             logger.warning(f"Some frames still missing after generation: {still_missing}")
+        else:
+            logger.info("All required saliency maps generated successfully")
         
         return all_maps
-    
     
     def process_video_analysis(
         self,
@@ -569,7 +710,6 @@ class DirectorsCutProcessor:
         # Step 2: Check for existing saliency maps
         existing_maps = self.check_saliency_maps(saliency_dir)
         
-        
         # Step 3: Generate missing saliency maps
         all_saliency_maps = self.generate_missing_saliency_maps(
              video_path, video_frames_dir, saliency_dir, existing_maps
@@ -578,7 +718,6 @@ class DirectorsCutProcessor:
         # Step 4: Calculate overlaps and attention scores
         attention_scores = []
         
-        #TODO: consider parallel processing for performance
         def process_frame(frame_data):
             dc_frame, saliency_map_path = frame_data
             try:
@@ -628,7 +767,7 @@ class DirectorsCutProcessor:
                         )
         
         # Step 5: Generate attention map
-        video_title = video_path.split('/')[-1].rsplit('.', 1)[0]
+        video_title = Path(video_path).stem
         if attention_scores:
             output_map_path = self.output_dir / f"{video_title}_attention_map.png"
             self.attention_analyzer.generate_attention_map(
@@ -727,10 +866,10 @@ if __name__ == "__main__":
     # Example of how to use the application
     app = DirectorsCutApplication()
     
-    #TODO define standart paths 
+    # Define standart paths 
     video_path = "videos/mono_smart.mp4"
     dc_file_path = "DirectorsCut/DC-smart.txt"
-    video_frames_dir = "VideoData/mono_smart_59"
+    video_frames_dir = "VideoData/mono_smart"
     saliency_maps_dir = "saliency_maps"
     output_dir = "results"
     
