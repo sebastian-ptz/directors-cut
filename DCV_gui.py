@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from abc import ABC, abstractmethod
 import threading
 
-from PySide6.QtCore import Qt, QUrl, QSize, QThread, Signal
+from PySide6.QtCore import Qt, QUrl, QSize, QThread, Signal, QRectF
 from PySide6.QtGui import QPixmap, QPainter, QPen, QAction, QColor, QIcon, QMouseEvent, QCursor 
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -167,6 +167,7 @@ class VideoPlayer(QMainWindow):
         self.directors_cut_data: List[DirectorsCutFrame] = []
         self.analysis_worker = None
         self.is_dragging_slider = False # To prevent constant updates while dragging
+        self.current_video_title = "" # Store current video title for DC loading
 
         # Overlay states
         self.show_directors_cut = False
@@ -207,10 +208,15 @@ class VideoPlayer(QMainWindow):
         self.directors_cut_action.triggered.connect(self.toggle_directors_cut_overlay)
         self.saliency_overlay_action.triggered.connect(self.toggle_saliency_overlay)
         self.highlight_brush_action.triggered.connect(self.toggle_highlight_brush)
-        self.directors_map_label.positionClicked.connect(self.change_duration_using_directors_map)
+
+        self.directors_cut_action.setEnabled(False) # Initially disabled until DC data is loaded
+        self.highlight_brush_action.setEnabled(False) # Disabled beause there is no brush functionality yet
+        
 
         # --- DIRECTORS MAP FUNCTIONALITY ---
-        self.media_player.durationChanged.connect(self.handle_duration_changed)
+        self.directors_map_label.positionClicked.connect(self.change_duration_using_directors_map)
+
+        self.media_player.durationChanged.connect(self.update_slider_range)
         self.media_player.errorOccurred.connect(self.handle_media_error)
         self.media_player.playbackStateChanged.connect(self.handle_playback_state)
 
@@ -223,6 +229,9 @@ class VideoPlayer(QMainWindow):
         self.media_player = QMediaPlayer()
         self.audio_output = QAudioOutput()
         
+        self.media_player.positionChanged.connect(self.update_slider_position)
+        self.media_player.durationChanged.connect(self.update_slider_range)
+        self.media_player.mediaStatusChanged.connect(self.on_media_status_changed)
         # Fix for audio channel layout error - set a proper audio format
         try:
             # Set default audio format to avoid channel layout issues
@@ -412,6 +421,63 @@ class VideoPlayer(QMainWindow):
         else:
             return self.style().standardIcon(fallback_icon)
 
+    def try_load_directors_cut_data(self, video_title: str) -> bool:
+        """
+        Try to automatically load directors cut data from standard path.
+        Returns True if successful, False otherwise.
+        Updates the directors_cut_action button state accordingly.
+        """
+        try:
+            # Construct standard path: directors_cut_data/DC-{video_title}.txt
+            dc_file_path = Path("directors_cut_data") / f"DC-{video_title}.txt"
+            
+            logger.info(f"Attempting to load Directors Cut data from: {dc_file_path}")
+            
+            if not dc_file_path.exists():
+                logger.info(f"Directors Cut file not found at standard path: {dc_file_path}")
+                self.directors_cut_data = []
+                self.directors_cut_action.setEnabled(False)
+                self.directors_cut_action.setChecked(False)
+                self.directors_cut_action.setToolTip("Directors Cut data not available for this video")
+                return False
+            
+            # Try to load the data
+            data = np.loadtxt(dc_file_path)
+            self.directors_cut_data = [
+                DirectorsCutFrame(
+                    frame_index=int(row[0]),
+                    azimuth_pixel=row[1],
+                    elevation_pixel=row[2]
+                ) for row in data
+            ]
+            
+            # Successfully loaded data
+            logger.info(f"Successfully loaded Directors Cut data: {len(self.directors_cut_data)} frames")
+            self.directors_cut_action.setEnabled(True)
+            self.directors_cut_action.setToolTip("Toggle Directors Cut overlay visualization")
+            
+            # Also update the analysis tab DC path if it's not already set
+            if hasattr(self, 'dc_path_label') and self.dc_path_label.text() == "No DC file selected":
+                self.dc_path_label.setText(str(dc_file_path))
+            
+            return True
+            
+        except FileNotFoundError:
+            logger.info(f"Directors Cut file not found: {dc_file_path}")
+            self.directors_cut_data = []
+            self.directors_cut_action.setEnabled(False)
+            self.directors_cut_action.setChecked(False)
+            self.directors_cut_action.setToolTip("Directors Cut data not available for this video")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error loading Directors Cut data from {dc_file_path}: {e}")
+            self.directors_cut_data = []
+            self.directors_cut_action.setEnabled(False)
+            self.directors_cut_action.setChecked(False)
+            self.directors_cut_action.setToolTip(f"Error loading Directors Cut data: {str(e)}")
+            return False
+
     def create_analysis_tab(self):
         """Create the analysis configuration tab"""
         analysis_widget = QWidget()
@@ -559,40 +625,48 @@ class VideoPlayer(QMainWindow):
             if selected_dir:
                 self.saliency_maps_path_label.setText(selected_dir[0].toLocalFile())
 
+    def extract_video_title(self, file_path: str) -> str:
+        """Extract video title from file path (filename without extension)"""
+        return Path(file_path).stem
+
+    # In the VideoPlayer class
+
     def load_video(self, file_path: str):
         """Load video into the media player and extract metadata."""
         if not os.path.exists(file_path):
             QMessageBox.warning(self, "File Not Found", f"Video file not found: {file_path}")
-            self.video_filename.setText("No video loaded")
-            self.media_player.setSource(QUrl()) # Clear current source
             return
 
         try:
-            self.media_player.setSource(QUrl.fromLocalFile(file_path))
-            self.video_filename.setText(os.path.basename(file_path))
-            
-            # Brief play and pause to initialize media player
-            self.media_player.play()
-            self.media_player.pause()
+            # 1. Stop any current playback and clear the source to release the old file.
+            # This is the most critical step to prevent freezes.
+            self.media_player.stop()
+            self.media_player.setSource(QUrl())
 
-            # Use OpenCV to get actual frame count and FPS
+            # 2. Use OpenCV to get metadata. This is done synchronously and is safe.
             cap = cv2.VideoCapture(file_path)
             if cap.isOpened():
                 self.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
                 self.actual_fps = cap.get(cv2.CAP_PROP_FPS)
                 cap.release()
-                self.framecode_label.setText(f"frame: 0 / {self.total_frames}")
                 logger.info(f"Loaded video: {file_path}, Frames: {self.total_frames}, FPS: {self.actual_fps}")
             else:
-                self.total_frames = 0
-                self.actual_fps = 0.0
-                self.framecode_label.setText("frame: - / -")
-                logger.warning(f"Could not open video with OpenCV: {file_path}")
+                cap.release()
+                QMessageBox.critical(self, "Video Load Error", f"Could not open video with OpenCV: {file_path}")
+                return
 
-            self.timeline_slider.setRange(0, 0) # Reset slider
-            self.media_player.setPosition(0) # Reset playback position
-            self.update_play_button_icon(self.media_player.playbackState())
-            
+            # 3. Reset UI state for the new video
+            self.video_filename.setText(os.path.basename(file_path))
+            self.current_video_title = self.extract_video_title(file_path)
+            self.timeline_slider.setValue(0)
+            self.update_play_button_icon(QMediaPlayer.PlaybackState.StoppedState)
+
+            # 4. Set the new source. The on_media_status_changed signal will handle what happens next.
+            self.media_player.setSource(QUrl.fromLocalFile(file_path))
+
+            # 5. Automatically try to load associated data
+            self.try_load_directors_cut_data(self.current_video_title)
+
         except Exception as e:
             logger.error(f"Error loading video: {e}")
             QMessageBox.critical(self, "Video Load Error", f"Could not load video:\n{str(e)}")
@@ -613,10 +687,11 @@ class VideoPlayer(QMainWindow):
             self.timeline_slider.setValue(position)
             self.update_timecode(position)
             self.update_framecode(position)
-            self.video_widget.update() # Trigger repaint for overlays
+            # self.video_widget.update() # This will be handled by playbackStateChanged for overlays when paused
 
     def update_slider_range(self, duration):
         """Update timeline slider range based on video duration."""
+        self.video_duration_ms = duration
         self.timeline_slider.setRange(0, duration)
         self.update_timecode(self.media_player.position())
 
@@ -650,6 +725,7 @@ class VideoPlayer(QMainWindow):
         """Handle slider released event."""
         self.is_dragging_slider = False
         self.media_player.setPosition(self.timeline_slider.value())
+        self.video_widget.update() # Force repaint after seeking when not dragging
 
     def on_slider_moved(self, position):
         """Handle slider moved event (for smooth scrubbing)."""
@@ -704,10 +780,32 @@ class VideoPlayer(QMainWindow):
         except Exception as e:
             logger.error(f"Playback rate error: {e}")
 
+    def on_media_status_changed(self, status: QMediaPlayer.MediaStatus):
+        """
+        Handles UI updates when the media is confirmed to be loaded.
+        This is the safe way to proceed after setting a new source.
+        """
+        logger.info(f"Media status changed: {status}")
+        if status == QMediaPlayer.MediaStatus.LoadedMedia:
+            # Update the UI elements
+            self.update_slider_range(self.media_player.duration())
+            self.update_timecode(0)
+            self.update_framecode(0)
+            # Ensure the UI reflects the initial state
+            self.timecode_label.setText("00:00")
+            self.framecode_label.setText(f"frame: 0 / {self.total_frames}")
+            
+            # Rendering first Frame
+            self.media_player.play()
+            self.media_player.pause()
+
+        elif status == QMediaPlayer.MediaStatus.InvalidMedia:
+            logger.error("The loaded media is invalid.")
+            QMessageBox.critical(self, "Media Error", "The video file is invalid or could not be played.")
+
     def handle_duration_changed(self, duration_ms: int):
         self.video_duration_ms = duration_ms
         print(f"Video duration loaded: {self.video_duration_ms} ms")
-        # Start playback after duration is known if you want
         if self.media_player.playbackState() == QMediaPlayer.PlaybackState.StoppedState:
              self.media_player.play()
 
@@ -716,6 +814,7 @@ class VideoPlayer(QMainWindow):
 
     def handle_playback_state(self, state: QMediaPlayer.PlaybackState):
         print(f"Playback state changed: {state}")
+        self.video_widget.update() # Trigger repaint to show overlays
 
     def change_duration_using_directors_map(self, relative_position: float):
         if self.video_duration_ms > 0:
@@ -767,7 +866,7 @@ class VideoPlayer(QMainWindow):
                 self.current_saliency_map = None
                 self.saliency_map_view_label.setText(f"Saliency map not found for {algorithm_name}. Run analysis first.")
         elif self.current_view_mode == "directors-map":
-            video_title = self.video_path_label.text().split('/')[-1].rsplit('.', 1)[0] if self.video_path_label.text() != "No video selected" else "unknown"
+            video_title = self.current_video_title if self.current_video_title else "unknown"
             attention_map_path = f"results/{video_title}_attention_map.png"
             if Path(attention_map_path).exists():
                 loaded_pixmap = QPixmap(attention_map_path)
@@ -793,7 +892,7 @@ class VideoPlayer(QMainWindow):
             pixmap_to_draw = self.current_saliency_map.copy()
         elif self.current_view_mode == "directors-map":
             target_label = self.directors_map_label
-            video_title = self.video_path_label.text().split('/')[-1].rsplit('.', 1)[0] if self.video_path_label.text() != "No video selected" else "unknown"
+            video_title = self.current_video_title if self.current_video_title else "unknown"
             attention_map_path = f"results/{video_title}_attention_map.png"
             if Path(attention_map_path).exists():
                 pixmap_to_draw = QPixmap(attention_map_path)
@@ -806,7 +905,7 @@ class VideoPlayer(QMainWindow):
                     progress_ratio = position / duration
                     marker_x = int(progress_ratio * pixmap_to_draw.width())
                     painter = QPainter(pixmap_to_draw)
-                    pen = QPen(QColor("black"), 10) # Thicker yellow line
+                    pen = QPen(QColor("black"), 10) # Thicker black line
                     painter.setPen(pen)
                     painter.drawLine(marker_x, 0, marker_x, pixmap_to_draw.height())
                     painter.end()
@@ -818,31 +917,31 @@ class VideoPlayer(QMainWindow):
     def paint_video_frame(self, event):
         """Custom paint event for video_widget to draw overlays."""
         try:
-            # Call original paint event first
+            # QVideoWidget's paintEvent handles rendering the current video frame.
             QVideoWidget.paintEvent(self.video_widget, event)
 
-            painter = QPainter(self.video_widget)
-            
-            # Get current frame index
-            current_ms = self.media_player.position()
-            if self.actual_fps > 0:
-                current_frame_index = int((current_ms / 1000.0) * self.actual_fps)
-            else:
-                current_frame_index = -1
+            # Only draw overlays if the video is paused
+            if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
+                painter = QPainter(self.video_widget)
 
-            video_rect = self.video_widget.rect()
-            image_width = video_rect.width()
-            image_height = video_rect.height()
+                # Get current frame index
+                current_ms = self.media_player.position()
+                if self.actual_fps > 0:
+                    current_frame_index = int((current_ms / 1000.0) * self.actual_fps)
+                else:
+                    current_frame_index = -1
 
-            if self.show_directors_cut and self.directors_cut_data:
-                self.draw_directors_cut_overlay(painter, current_frame_index, image_width, image_height)
+                video_rect = self.video_widget.rect()
+                image_width = video_rect.width()
+                image_height = video_rect.height()
+                if self.show_directors_cut:
+                    logger.info("Calling draw_directors_cut_overlay")
+                    self.draw_directors_cut_overlay(painter, current_frame_index, image_width, image_height)
 
-            if self.show_saliency_overlay and self.attention_scores:
-                self.draw_saliency_attention_overlay(painter, current_frame_index, image_width, image_height)
-            
-            # You could implement highlight brush drawing here if needed
+                if self.show_saliency_overlay:
+                    self.draw_saliency_attention_overlay(painter, current_frame_index, image_width, image_height)
 
-            painter.end()
+                painter.end()
         except Exception as e:
             logger.warning(f"Paint event error: {e}")
 
@@ -854,14 +953,18 @@ class VideoPlayer(QMainWindow):
                     # Convert normalized pixel coordinates to display pixel coordinates
                     # Assuming dc_file_path has normalized pixel coordinates (0-width, 0-height)
                     # You might need to adjust this if the coordinates are spherical or percentage based
-                    azimuth_display_pixel = (dc_frame.azimuth_pixel / 360.0) * image_width
-                    elevation_display_pixel = (dc_frame.elevation_pixel / 180.0) * image_height
-                    
-                    # Draw a circle at the Directors Cut point
-                    pen = QPen(QColor("blue"), 5) # Blue circle for Directors Cut
+                    azimuth_display_pixel = dc_frame.azimuth_pixel
+                    elevation_display_pixel = dc_frame.elevation_pixel
+                    logger.info(f"Drawing Directors Cut at frame {current_frame_index}: azimuth={azimuth_display_pixel}, elevation={elevation_display_pixel}") 
+                    # TODO Get viewport and draw it
+
+                    # Use the painter passed in, already set up for self.video_widget
+                    pen = QPen(QColor("blue"), 5) # Blue circle for Directors Cut Position
                     painter.setPen(pen)
-                    # Draw relative to the video_widget's top-left corner
-                    painter.drawEllipse(int(azimuth_display_pixel) - 10, int(elevation_display_pixel) - 10, 20, 20)
+                    # Draw relative to the video_widget's top-left corner#
+                    diameter = 20 # Diameter of the circle
+                    painter.drawEllipse(QRectF(-diameter / 2.0, -diameter / 2.0, diameter, diameter))
+                    #painter.drawEllipse(int(azimuth_display_pixel) - 10, int(elevation_display_pixel) - 10, 20, 20)
                     break
         except Exception as e:
             logger.warning(f"Directors cut overlay error: {e}")
@@ -902,7 +1005,7 @@ class VideoPlayer(QMainWindow):
     def toggle_highlight_brush(self):
         """Toggle the highlight brush functionality."""
         self.show_highlight_brush = self.highlight_brush_action.isChecked()
-        # Additional logic for brush interaction (e.g., mouse events) would go here
+        # Additional logic for brush goes here
         self.video_widget.update() # Trigger repaint
 
     # --- Analysis Tab Functions ---
@@ -977,21 +1080,9 @@ class VideoPlayer(QMainWindow):
         self.update_saliency_display() # Refresh maps if they depend on analysis results
         self.video_widget.update() # Trigger repaint for overlays
 
-        # Also load directors cut data for overlay drawing if not already loaded
-        dc_file_path = self.dc_path_label.text()
-        if Path(dc_file_path).exists():
-            try:
-                data = np.loadtxt(dc_file_path)
-                self.directors_cut_data = [
-                    DirectorsCutFrame(
-                        frame_index=int(row[0]),
-                        azimuth_pixel=row[1],
-                        elevation_pixel=row[2]
-                    ) for row in data
-                ]
-                logger.info(f"Directors Cut data re-loaded for overlay: {len(self.directors_cut_data)} frames")
-            except Exception as e:
-                logger.error(f"Error re-loading Directors Cut file for overlay: {e}")
+        # Try to reload directors cut data for overlay drawing if analysis used different file
+        if self.current_video_title:
+            self.try_load_directors_cut_data(self.current_video_title)
 
     def on_analysis_error(self, error_message: str):
         self.progress_bar.setVisible(False)
