@@ -1,5 +1,24 @@
+# Python 3.8.20 tested requirements
+
+# GUI Framework
+PySide6
+
+# Core scientific computing
+matplotlib
 opencv-python
 numpy
-matplotlib
 scipy
-PySide6
+scikit-image
+pillow
+
+# Machine Learning
+onnxruntime
+
+# PyTorch for CUDA 10.2 (Windows Python 3.8)
+https://download.pytorch.org/whl/cu102/torch-1.5.1-cp38-cp38-win_amd64.whl # torch=1.5.1
+https://download.pytorch.org/whl/cu102/torchvision-0.6.1-cp38-cp38-win_amd64.whl    # torchvision=0.6.1
+
+# Note: Upgrade pillow to fix deprecation warning
+# Fix required in dataset/utils.py line ~180:
+# Change: Image.ANTIALIAS to Image.LANCZOS
+# vgg_img = vgg_img.resize((target_size[1], target_size[0]), Image.LANCZOS)
