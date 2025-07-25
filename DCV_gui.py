@@ -172,7 +172,6 @@ class VideoPlayer(QMainWindow):
         # Overlay states
         self.show_directors_cut = False
         self.show_saliency_overlay = False
-        self.show_highlight_brush = False
         self.current_view_mode = "video-player" # "video-player", "directors-map", "saliency-map"
 
         self.setWindowTitle("360° Directors Cut Analysis")
@@ -195,7 +194,7 @@ class VideoPlayer(QMainWindow):
 
         # --- INITIAL STATE ---
         self.audio_output.setVolume(self.volume_before_mute / 100.0)
-        self.update_saliency_display()
+        self.update_bottom_display()
         self.timecode_label.setText("00:00")
         self.framecode_label.setText("frame: - / -")
         self.update_volume_icon()
@@ -207,11 +206,8 @@ class VideoPlayer(QMainWindow):
         self.saliency_map_action.triggered.connect(lambda: self.switch_view("saliency-map"))
         self.directors_cut_action.triggered.connect(self.toggle_directors_cut_overlay)
         self.saliency_overlay_action.triggered.connect(self.toggle_saliency_overlay)
-        self.highlight_brush_action.triggered.connect(self.toggle_highlight_brush)
 
         self.directors_cut_action.setEnabled(False) # Initially disabled until DC data is loaded
-        self.highlight_brush_action.setEnabled(False) # Disabled beause there is no brush functionality yet
-        
 
         # --- DIRECTORS MAP FUNCTIONALITY ---
         self.directors_map_label.positionClicked.connect(self.change_duration_using_directors_map)
@@ -278,29 +274,24 @@ class VideoPlayer(QMainWindow):
         player_layout.addWidget(self.toolbar)
 
         # Create actions with fallback icons if custom icons don't exist
-        self.open_file_action = QAction(self.get_icon("./icons/file-open.svg", QStyle.StandardPixmap.SP_DirOpenIcon), "Open Video File", self)
+        self.open_file_action = QAction(self.get_icon("./icons/file-open.svg", QStyle.StandardPixmap.SP_DirIcon), "Open Video File", self)
         self.toolbar.addAction(self.open_file_action)
         self.toolbar.addSeparator()
 
-        self.directors_map_action = QAction(self.get_icon("./icons/directors-map.svg", QStyle.StandardPixmap.SP_ComputerIcon), "Directors Map", self)
+        self.directors_map_action = QAction(self.get_icon("./icons/directors-map.svg", QStyle.StandardPixmap.SP_TitleBarMaxButton), "Directors Map", self)
         self.directors_map_action.setCheckable(True)
-        self.saliency_map_action = QAction(self.get_icon("./icons/saliency-map.svg", QStyle.StandardPixmap.SP_ComputerIcon), "Saliency Map", self)
+        self.saliency_map_action = QAction(self.get_icon("./icons/saliency-map.svg", QStyle.StandardPixmap.SP_TitleBarMaxButton), "Saliency Map", self)
         self.saliency_map_action.setCheckable(True)
         self.toolbar.addAction(self.directors_map_action)
         self.toolbar.addAction(self.saliency_map_action)
         self.toolbar.addSeparator()
 
-        self.directors_cut_action = QAction(self.get_icon("./icons/directors-cut.svg", QStyle.StandardPixmap.SP_DialogApplyButton), "Directors Cut", self)
+        self.directors_cut_action = QAction(self.get_icon("./icons/directors-cut.svg", QStyle.StandardPixmap.SP_TitleBarNormalButton), "Directors Cut", self)
         self.directors_cut_action.setCheckable(True)
-        self.saliency_overlay_action = QAction(self.get_icon("./icons/saliency-overlay.svg", QStyle.StandardPixmap.SP_DialogApplyButton), "Saliency Overlay", self)
+        self.saliency_overlay_action = QAction(self.get_icon("./icons/saliency-overlay.svg", QStyle.StandardPixmap.SP_TitleBarNormalButton), "Saliency Overlay", self)
         self.saliency_overlay_action.setCheckable(True)
         self.toolbar.addAction(self.directors_cut_action)
         self.toolbar.addAction(self.saliency_overlay_action)
-        self.toolbar.addSeparator()
-
-        self.highlight_brush_action = QAction(self.get_icon("./icons/paint-brush.svg", QStyle.StandardPixmap.SP_DialogApplyButton), "Highlight Brush", self)
-        self.highlight_brush_action.setCheckable(True)
-        self.toolbar.addAction(self.highlight_brush_action)
 
         # --- VIEWS ---
         self.directors_map_label = ClickableImageLabel("Attention Map will be displayed here after analysis")
@@ -347,7 +338,7 @@ class VideoPlayer(QMainWindow):
         
         self.saliency_predictors = QComboBox()
         self.saliency_predictors.addItems(["FastSal"]) # These correspond to saliency algorithms
-        self.saliency_predictors.currentTextChanged.connect(self.update_saliency_display) # This should trigger a display update
+        self.saliency_predictors.currentTextChanged.connect(self.update_bottom_display) # This should trigger a display update
         
         self.framecode_label = QLabel("frame: - / -")
         self.framecode_label.setMinimumWidth(100)
@@ -791,6 +782,7 @@ class VideoPlayer(QMainWindow):
             self.update_slider_range(self.media_player.duration())
             self.update_timecode(0)
             self.update_framecode(0)
+            self.update_bottom_display()
             # Ensure the UI reflects the initial state
             self.timecode_label.setText("00:00")
             self.framecode_label.setText(f"frame: 0 / {self.total_frames}")
@@ -844,13 +836,21 @@ class VideoPlayer(QMainWindow):
             self.saliency_map_view_label.setVisible(True)
             self.saliency_map_action.setChecked(True)
         
-        self.update_saliency_display() # Update display based on new view
+        self.update_bottom_display() # Update display based on new view
 
-    def update_saliency_display(self):
+    def update_bottom_display(self):
         """Update the saliency map or directors map display."""
+
+        video_title = self.current_video_title if self.current_video_title else "unknown"
         if self.current_view_mode == "saliency-map":
+
+            current_ms = self.media_player.position()
+            if self.actual_fps > 0:
+                current_frame_index = int((current_ms / 1000.0) * self.actual_fps)
+
             algorithm_name = self.saliency_predictors.currentText()
-            image_filename = f"results/saliency_map_{algorithm_name}.png" # Standard name from DCmain
+            logger.info(f"Trying to load :saliency_maps/{algorithm_name}/out_frame_{current_frame_index:05d}.jpg")
+            image_filename = f"saliency_maps/{algorithm_name}/{video_title}/out_frame_{current_frame_index:05d}.jpg" # Standard name from DCmain
             if Path(image_filename).exists():
                 loaded_pixmap = QPixmap(image_filename)
                 if not loaded_pixmap.isNull():
@@ -866,7 +866,6 @@ class VideoPlayer(QMainWindow):
                 self.current_saliency_map = None
                 self.saliency_map_view_label.setText(f"Saliency map not found for {algorithm_name}. Run analysis first.")
         elif self.current_view_mode == "directors-map":
-            video_title = self.current_video_title if self.current_video_title else "unknown"
             attention_map_path = f"results/{video_title}_attention_map.png"
             if Path(attention_map_path).exists():
                 loaded_pixmap = QPixmap(attention_map_path)
@@ -890,6 +889,8 @@ class VideoPlayer(QMainWindow):
         if self.current_view_mode == "saliency-map" and self.current_saliency_map:
             target_label = self.saliency_map_view_label
             pixmap_to_draw = self.current_saliency_map.copy()
+            pixmap_to_draw.scaled(target_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            return
         elif self.current_view_mode == "directors-map":
             target_label = self.directors_map_label
             video_title = self.current_video_title if self.current_video_title else "unknown"
@@ -1002,11 +1003,6 @@ class VideoPlayer(QMainWindow):
         self.show_saliency_overlay = self.saliency_overlay_action.isChecked()
         self.video_widget.update() # Trigger repaint
 
-    def toggle_highlight_brush(self):
-        """Toggle the highlight brush functionality."""
-        self.show_highlight_brush = self.highlight_brush_action.isChecked()
-        # Additional logic for brush goes here
-        self.video_widget.update() # Trigger repaint
 
     # --- Analysis Tab Functions ---
     def start_analysis(self):
@@ -1077,7 +1073,7 @@ class VideoPlayer(QMainWindow):
         QMessageBox.information(self, "Analysis Complete", "Directors Cut analysis finished successfully!")
         self.display_results()
         self.tab_widget.setCurrentIndex(2) # Switch to Results tab
-        self.update_saliency_display() # Refresh maps if they depend on analysis results
+        self.update_bottom_display() # Refresh maps if they depend on analysis results
         self.video_widget.update() # Trigger repaint for overlays
 
         # Try to reload directors cut data for overlay drawing if analysis used different file
