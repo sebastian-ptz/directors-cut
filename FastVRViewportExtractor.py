@@ -150,7 +150,7 @@ class VRViewportExtractor:
         # Use vectorized sampling with interpolation
         output = self._sample_bilinear_vectorized(src_x, src_y)
         
-        return Image.fromarray(output.astype(np.uint8))
+        return output
     
     def _sample_bilinear_vectorized(self, src_x, src_y):
         """
@@ -329,7 +329,9 @@ def example_usage():
     Example usage with automatic optimization selection
     """
     # Initialize extractor
-    extractor = VRViewportExtractor("VideoData/mono_smart_59/frame_05822.jpg")
+    extractor = VRViewportExtractor("saliency_maps/FastSal/mono_jaunt/out_frame_00200.jpg")
+    img_sum = np.sum(cv2.imread("saliency_maps/FastSal/mono_jaunt/out_frame_00200.jpg"))
+    print(f"Image sum:{img_sum}")
     
     # VR specifications
     vr_specs = {
@@ -351,8 +353,13 @@ def example_usage():
     else:
         print("Using NumPy vectorized operations...")
         viewport = extractor.extract_viewport_vectorized(center_coords, vr_specs)
-    
-    viewport.save("vr_viewport_optimized.jpg")
+            
+    print(f"Extracted viewport pixel sum: {np.sum(viewport)}")
+    viewport_img = Image.fromarray(viewport.astype(np.uint8))
+    print(f"Viewport image sum: {np.sum(viewport_img)}")
+    print(f"overlap perventage: {np.sum(viewport) / img_sum * 100:.2f}%")
+    viewport_img.save("vr_viewport_optimized.jpg")
+
     print("Viewport extraction completed!")
 
 # Fix NumPy/Numba compatibility function

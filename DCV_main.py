@@ -266,6 +266,23 @@ class ViewportExtractor:
         viewport_height_px: int = 768
     ) -> np.ndarray:
         """Extract viewport pixels using FastVRViewportExtractor"""
+        
+        # Validate viewport center coordinates
+        if isinstance(equirectangular_image, Image.Image):
+            img_width, img_height = equirectangular_image.size
+        else:
+            # If it's a path, load to get dimensions
+            temp_img = Image.open(str(equirectangular_image))
+            img_width, img_height = temp_img.size
+        
+        # Ensure viewport center is within image bounds
+        center_x = max(0, min(img_width - 1, viewport_center[0]))
+        center_y = max(0, min(img_height - 1, viewport_center[1]))
+        
+        logger.debug(f"Image size: {img_width}x{img_height}")
+        logger.debug(f"Viewport center (original): {viewport_center}")
+        logger.debug(f"Viewport center (clamped): {center_x}, {center_y}")
+        
         # Save image to temp file if needed
         if isinstance(equirectangular_image, Image.Image):
             temp_path = "temp_equirect.png"
@@ -279,7 +296,7 @@ class ViewportExtractor:
             self.current_extractor = VRViewportExtractor(image_path)
             self.current_image_path = image_path
             
-        # Prepare VR specs
+        # Prepare VR specs with validated dimensions
         vr_specs = {
             'horizontal_fov': self.h_fov_deg,
             'vertical_fov': self.v_fov_deg,
@@ -287,16 +304,28 @@ class ViewportExtractor:
             'height': viewport_height_px
         }
         
-        center_px = int(viewport_center[0])
-        center_py = int(viewport_center[1])
+        center_px = int(center_x)
+        center_py = int(center_y)
         
-        # Extract viewport
-        viewport = self.current_extractor.extract_viewport_vectorized(
-            (center_px, center_py),
-            vr_specs
-        )
-        
-        return np.array(viewport)
+        try:
+            # Extract viewport
+            viewport = self.current_extractor.extract_viewport_vectorized(
+                (center_px, center_py),
+                vr_specs
+            )
+            
+            # Convert to numpy array and ensure proper format
+            viewport_array = np.array(viewport)
+            
+            logger.debug(f"Extracted viewport shape: {viewport_array.shape}")
+            logger.debug(f"Viewport value range: {viewport_array.min()} - {viewport_array.max()}")
+            
+            return viewport_array
+            
+        except Exception as e:
+            logger.error(f"Error in viewport extraction: {e}")
+            # Return a zero array with expected dimensions
+            return np.zeros((viewport_height_px, viewport_width_px), dtype=np.float32)
     
     def _normalize_vector(self, v):
         """Normalize a vector"""
@@ -406,14 +435,56 @@ class OverlapCalculator:
     ) -> float:
         """Calculate overlap percentage between viewport and saliency map"""
         
-        # Extract viewport from saliency map
-        viewport_pixels = self.viewport_extractor.extract_viewport_pixels(
-            saliency_map, viewport_center
-        )
+        # Convert PIL Image to numpy array for consistent processing
+        saliency_array = np.array(saliency_map)
         
-        # Calculate saliency values in viewport
+        # Handle different image formats
+        if len(saliency_array.shape) == 3:
+            # If RGB/RGBA, convert to grayscale
+            if saliency_array.shape[2] == 3:
+                saliency_array = np.mean(saliency_array, axis=2)
+            elif saliency_array.shape[2] == 4:
+                saliency_array = np.mean(saliency_array[:, :, :3], axis=2)
+        
+        # Normalize saliency values to [0, 1] range
+        if saliency_array.max() > 1.0:
+            saliency_array = saliency_array / 255.0
+        
+        # Extract viewport from saliency map
+        try:
+            viewport_pixels = self.viewport_extractor.extract_viewport_pixels(
+                saliency_map, viewport_center
+            )
+            
+            # Ensure viewport_pixels is a numpy array
+            if not isinstance(viewport_pixels, np.ndarray):
+                viewport_pixels = np.array(viewport_pixels)
+            
+            # Handle different viewport formats
+            if len(viewport_pixels.shape) == 3:
+                # If RGB/RGBA, convert to grayscale
+                if viewport_pixels.shape[2] == 3:
+                    viewport_pixels = np.mean(viewport_pixels, axis=2)
+                elif viewport_pixels.shape[2] == 4:
+                    viewport_pixels = np.mean(viewport_pixels[:, :, :3], axis=2)
+            
+            # Normalize viewport values to [0, 1] range
+            if viewport_pixels.max() > 1.0:
+                viewport_pixels = viewport_pixels / 255.0
+            
+        except Exception as e:
+            logger.error(f"Error extracting viewport: {e}")
+            return 0.0
+        
+        # Calculate saliency values
         viewport_saliency_sum = np.sum(viewport_pixels)
-        total_saliency_sum = np.sum(np.array(saliency_map))
+        total_saliency_sum = np.sum(saliency_array)
+        
+        # Debug logging
+        logger.debug(f"Viewport saliency sum: {viewport_saliency_sum}")
+        logger.debug(f"Total saliency sum: {total_saliency_sum}")
+        logger.debug(f"Viewport shape: {viewport_pixels.shape}")
+        logger.debug(f"Saliency map shape: {saliency_array.shape}")
         
         # Calculate overlap percentage
         if total_saliency_sum > 0:
@@ -421,7 +492,10 @@ class OverlapCalculator:
         else:
             overlap_percentage = 0.0
         
-        return min(overlap_percentage, 1.0)  # Cap at 100%
+        # Ensure the result is within valid bounds
+        overlap_percentage = max(0.0, min(1.0, overlap_percentage))
+        
+        return overlap_percentage
 
 class AttentionAnalyzer:
     """Analyzes attention based on overlap scores"""
@@ -430,16 +504,7 @@ class AttentionAnalyzer:
     def calculate_attention_score(overlap_percentage: float) -> AttentionScore:
         """Convert overlap percentage to attention score with color coding"""
         
-        # Color coding based on your requirements
-        if overlap_percentage >= 0.5:
-            # High attention - Green
-            color_rgb = (0, 255, 0)
-        elif overlap_percentage >= 0.3:
-            # Medium attention - Blue
-            color_rgb = (0, 0, 255)
-        else:
-            # Low attention - Red
-            color_rgb = (255, 0, 0)
+        color_rgb = AttentionAnalyzer.get_dcs_color(overlap_percentage)
         
         return AttentionScore(
             frame_index=-1,  # Will be set by caller
@@ -466,6 +531,38 @@ class AttentionAnalyzer:
         map_image = Image.fromarray(map_array)
         map_image.save(output_path)
         logger.info(f"Attention map saved to: {output_path}")
+
+    @staticmethod
+    def get_dcs_color(overlap_percentage: float) -> Tuple[int, int, int]:
+        """
+        Calculates the RGB color tuple based on the overlap percentage for the Director's Cut Similarity Map.
+        The color coding transitions from blue-green (low overlap) to red (high overlap).
+
+        Args:
+            overlap_percentage (float): The calculated overlap percentage, ranging from 0.0 to 1.0.
+
+        Returns:
+            Tuple[int, int, int]: An RGB color tuple (0-255, 0-255, 0-255).
+        """
+        R, G, B = 0, 0, 0
+
+        if overlap_percentage >= 0.5:
+            # From green (0.5) to red (1.0)
+            R = int(255 * (2 * (overlap_percentage - 0.5)))
+            G = int(255 * (2 * (1 - overlap_percentage)))
+            B = 0
+        else:
+            # From blue (0.0) to green (0.5)
+            R = 0
+            G = int(255 * (2 * overlap_percentage))
+            B = int(255 * (2 * (0.5 - overlap_percentage)))
+        
+        # Ensure values are within 0-255 range
+        R = max(0, min(255, R))
+        G = max(0, min(255, G))
+        B = max(0, min(255, B))
+
+        return (R, G, B)
 
 class DirectorsCutProcessor:
     """Main processor for Directors Cut analysis"""
@@ -718,28 +815,7 @@ class DirectorsCutProcessor:
         # Step 4: Calculate overlaps and attention scores
         attention_scores = []
         
-        def process_frame(frame_data):
-            dc_frame, saliency_map_path = frame_data
-            try:
-                # Load saliency map
-                saliency_map = Image.open(saliency_map_path)
-                
-                # Calculate overlap
-                overlap_percentage = self.overlap_calculator.calculate_saliency_overlap(
-                    saliency_map, (dc_frame.azimuth_pixel, dc_frame.elevation_pixel)
-                )
-                
-                # Create attention score
-                attention_score = self.attention_analyzer.calculate_attention_score(
-                    overlap_percentage
-                )
-                attention_score.frame_index = dc_frame.frame_index
-                
-                return attention_score
-                
-            except Exception as e:
-                logger.error(f"Error processing frame {dc_frame.frame_index}: {e}")
-            return None
+        
 
         # Prepare frame data for processing
         frame_data = [
@@ -755,7 +831,7 @@ class DirectorsCutProcessor:
         with ThreadPoolExecutor(max_workers=8) as executor:
             for i in range(0, len(frame_data), batch_size):
                 batch = frame_data[i:i + batch_size]
-                futures = [executor.submit(process_frame, data) for data in batch]
+                futures = [executor.submit(self.process_frame, data) for data in batch]
                 
                 for future in as_completed(futures):
                     result = future.result()
@@ -778,6 +854,30 @@ class DirectorsCutProcessor:
             self._save_results(attention_scores)
         
         return attention_scores
+    
+    # Function to process each frame in parallel
+    def process_frame(self, frame_data):
+            dc_frame, saliency_map_path = frame_data
+            try:
+                # Load saliency map
+                saliency_map = Image.open(saliency_map_path)
+                
+                # Calculate overlap
+                overlap_percentage = self.overlap_calculator.calculate_saliency_overlap(
+                    saliency_map, (dc_frame.azimuth_pixel, dc_frame.elevation_pixel)
+                )
+                
+                # Create attention score
+                attention_score = self.attention_analyzer.calculate_attention_score(
+                    overlap_percentage
+                )
+                attention_score.frame_index = dc_frame.frame_index
+                
+                return attention_score
+                
+            except Exception as e:
+                logger.error(f"Error processing frame {dc_frame.frame_index}: {e}")
+            return None
     
     def _save_results(self, attention_scores: List[AttentionScore]):
         """Save detailed analysis results"""
@@ -860,6 +960,91 @@ class DirectorsCutApplication:
         
         logger.info(f"Analysis complete. Processed {len(attention_scores)} frames.")
         return attention_scores
+
+def debug_overlap_calculation(
+    saliency_map_path: str,
+    viewport_center: Tuple[float, float],
+    viewport_extractor: ViewportExtractor
+) -> Dict[str, Any]:
+    """
+    Debug function to analyze overlap calculation step by step
+    """
+    try:
+        # Load saliency map
+        saliency_map = Image.open(saliency_map_path)
+        saliency_array = np.array(saliency_map)
+        
+        print(f"Saliency map path: {saliency_map_path}")
+        print(f"Saliency map size: {saliency_map.size}")
+        print(f"Saliency array shape: {saliency_array.shape}")
+        print(f"Saliency array dtype: {saliency_array.dtype}")
+        print(f"Saliency value range: {saliency_array.min()} - {saliency_array.max()}")
+        
+        # Handle different image formats
+        if len(saliency_array.shape) == 3:
+            if saliency_array.shape[2] == 3:
+                saliency_array = np.mean(saliency_array, axis=2)
+            elif saliency_array.shape[2] == 4:
+                saliency_array = np.mean(saliency_array[:, :, :3], axis=2)
+        
+        # Normalize if needed
+        if saliency_array.max() > 1.0:
+            saliency_array = saliency_array / 255.0
+        
+        print(f"Processed saliency array shape: {saliency_array.shape}")
+        print(f"Processed saliency value range: {saliency_array.min()} - {saliency_array.max()}")
+        
+        # Extract viewport
+        viewport_pixels = viewport_extractor.extract_viewport_pixels(
+            saliency_map, viewport_center
+        )
+        
+        print(f"Viewport center: {viewport_center}")
+        print(f"Viewport pixels shape: {viewport_pixels.shape}")
+        print(f"Viewport pixels dtype: {viewport_pixels.dtype}")
+        print(f"Viewport value range: {viewport_pixels.min()} - {viewport_pixels.max()}")
+        
+        # Handle viewport format
+        if len(viewport_pixels.shape) == 3:
+            if viewport_pixels.shape[2] == 3:
+                viewport_pixels = np.mean(viewport_pixels, axis=2)
+            elif viewport_pixels.shape[2] == 4:
+                viewport_pixels = np.mean(viewport_pixels[:, :, :3], axis=2)
+        
+        # Normalize if needed
+        if viewport_pixels.max() > 1.0:
+            viewport_pixels = viewport_pixels / 255.0
+        
+        # Calculate sums
+        viewport_saliency_sum = np.sum(viewport_pixels)
+        total_saliency_sum = np.sum(saliency_array)
+        
+        print(f"Viewport saliency sum: {viewport_saliency_sum}")
+        print(f"Total saliency sum: {total_saliency_sum}")
+        
+        # Calculate overlap
+        if total_saliency_sum > 0:
+            overlap_percentage = viewport_saliency_sum / total_saliency_sum
+        else:
+            overlap_percentage = 0.0
+        
+        print(f"Raw overlap percentage: {overlap_percentage}")
+        print(f"Clamped overlap percentage: {max(0.0, min(1.0, overlap_percentage))}")
+        
+        return {
+            "saliency_shape": saliency_array.shape,
+            "saliency_range": (saliency_array.min(), saliency_array.max()),
+            "viewport_shape": viewport_pixels.shape,
+            "viewport_range": (viewport_pixels.min(), viewport_pixels.max()),
+            "viewport_sum": viewport_saliency_sum,
+            "total_sum": total_saliency_sum,
+            "raw_overlap": overlap_percentage,
+            "final_overlap": max(0.0, min(1.0, overlap_percentage))
+        }
+        
+    except Exception as e:
+        print(f"Error in debug function: {e}")
+        return {"error": str(e)}
 
 # Example usage
 if __name__ == "__main__":
